@@ -1,59 +1,50 @@
 # Interview Application API
 
-A FastAPI service that stores application details and CV PDF bytes in MySQL.
-The PDF is also attached to the notification email.
+A FastAPI service that accepts an application and PDF CV, then emails the
+application details and CV attachment to the configured company mailbox.
+The API has no database dependency and does not retain submissions; application
+data and CV bytes are processed in memory for email delivery only.
 
-## Configure MySQL and email
+## Configure email
 
-1. Create a MySQL database and a dedicated user with permission to create and
-   write tables in that database. For example, run the following in MySQL after
-   replacing the placeholders with your own values:
+Set these SMTP settings in the project's ignored `.env` file, or configure
+them as deployment environment variables:
 
-   ```sql
-   CREATE DATABASE your_database_name
-     CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-   CREATE USER 'your_database_user'@'localhost' IDENTIFIED BY 'your_password';
-   GRANT ALL PRIVILEGES ON your_database_name.* TO 'your_database_user'@'localhost';
-   ```
-
-2. Copy `.env.example` to `.env` and fill in the MySQL and SMTP settings. Use
-   the database host, port, database name, and username supplied by your MySQL
-   setup. Keep `.env` private; it is ignored by Git. Configure an SMTP mailbox
-   and set `MAIL_TO` to the company email that should receive applications.
-   Use an SMTP app password or provider-specific credential where required.
-
-   `MAIL_STARTTLS` and `MAIL_SSL_TLS` are mutually exclusive for most providers.
-   Use the values and port required by your SMTP provider.
-
-3. Install dependencies in the project's active virtual environment if needed:
-
-   ```powershell
-   .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-   ```
-
-The API creates the `applications` table when it starts. If it finds an older
-table layout, it migrates the legacy name and position columns and adds fields
-required by the current API while preserving existing application rows. PDFs
-from older applications are verified and migrated from `uploads/cvs/` into
-MySQL; their local copies are removed after a successful database migration.
-New PDF uploads are stored directly in MySQL. The database itself must already
-exist. Missing MySQL configuration prevents startup and is reported explicitly;
-the application does not invent credentials.
-
-## Run the API
-
-From the project directory in PowerShell:
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload
+```dotenv
+MAIL_SERVER=smtp.gmail.com
+MAIL_PORT=587
+MAIL_USERNAME=your_gmail_address
+MAIL_PASSWORD=your_gmail_app_password
+MAIL_FROM=your_gmail_address
+MAIL_TO=recipient_email_address
+MAIL_STARTTLS=true
+MAIL_SSL_TLS=false
 ```
 
-Open <http://127.0.0.1:8000/> to be redirected to the interactive Swagger
-documentation, or go directly to <http://127.0.0.1:8000/docs>.
+`MAIL_PASSWORD` must be a Google App Password, not the normal Google account
+password. App Passwords require 2-Step Verification. `MAIL_FROM` should match
+the authenticated Gmail account. Keep real credentials out of source control
+and logs. The API uses STARTTLS and waits for Gmail to accept the message before
+returning success.
 
-Uploaded PDF bytes are stored in the `applications.cv_data` MySQL `LONGBLOB`
-column and attached to the notification email. Include the MySQL database in
-your backups; CVs are no longer written to the local `uploads/cvs/` directory.
+Install dependencies if needed:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Run the API from the project directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000 --reload --reload-include .env
+```
+
+Open <http://127.0.0.1:8000/docs>.
+
+For deployment, install `requirements.txt`, provide the `MAIL_*` values via
+the hosting platform's secret environment settings, and start with
+`python -m uvicorn main:app --host 0.0.0.0 --port 8000` (use the platform's
+required port if it supplies one). No database URL or service is needed.
 
 ## Submit an application
 
@@ -66,7 +57,7 @@ The `POST /applications` endpoint accepts `multipart/form-data`:
 | `phone` | Yes | Applicant phone number |
 | `position` | Yes | Position applied for |
 | `cover_letter` | No | Cover letter |
-| `cv` | Yes | PDF file, maximum 5 MiB |
+| `cv` | Yes | Valid PDF file named with a `.pdf` extension, maximum 5 MiB |
 
 PowerShell/cURL example:
 
@@ -80,21 +71,18 @@ curl.exe -X POST "http://127.0.0.1:8000/applications" `
   -F "cv=@C:\path\to\resume.pdf;type=application/pdf"
 ```
 
-For retry-safe submissions, send an `Idempotency-Key` header and reuse it only
-for retries of the exact same application and PDF. A successful email is not
-sent again for that key. A failed email can be retried with the same key. Calls
-without this optional header create a new application each time.
+Each valid request sends a new email. Requests are not stored and retries are
+not deduplicated; a retry after an uncertain email result may send a duplicate.
 
 ## Responses
 
-Successful submission (HTTP `201`; an already completed idempotent retry uses
-HTTP `200`):
+Successful submission (HTTP `201`):
 
 ```json
 {
   "success": true,
-  "message": "Application received",
-  "application_id": 123
+  "message": "Application received and emailed",
+  "application_id": "a4f33e2a-5b10-4c25-a334-e7291735679a"
 }
 ```
 
@@ -116,18 +104,10 @@ CV larger than 5 MiB (HTTP `413`):
 }
 ```
 
-If the application is saved but SMTP delivery fails, the endpoint returns
-HTTP `502` with `success: false` and the saved `application_id`. The database
-record and CV are retained; if you submitted an idempotency key, retry with that
-same key. Otherwise, contact the company with that ID. Database failures return
-HTTP `503`. Invalid form data returns HTTP `422`.
-
-Example email failure response (HTTP `502`):
-
-```json
-{
-  "success": false,
-  "message": "The application was saved, but its notification email could not be sent. If you submitted an Idempotency-Key, retry with that same key; otherwise contact the company with the application ID.",
-  "application_id": 123
-}
-```
+If Gmail rejects the credentials, the endpoint returns HTTP `502` with a
+message to verify the Gmail address and App Password. Other SMTP connection,
+timeout, sender/recipient, and message rejection errors also return actionable
+HTTP `502` messages. Missing or invalid email configuration returns HTTP `503`.
+These responses include an `application_id`; the application and CV are not
+retained, so contact the company directly or submit again. Invalid form data
+returns HTTP `422`.

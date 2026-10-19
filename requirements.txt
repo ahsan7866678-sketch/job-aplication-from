@@ -1,9 +1,7 @@
 fastapi
 uvicorn[standard]
-SQLAlchemy
-PyMySQL
 python-dotenv
 python-multipart
-fastapi-mail
+aiosmtplib
 pypdf
 email-validator

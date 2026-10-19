@@ -1,4 +1,3 @@
-import hashlib
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -9,7 +8,6 @@ from pypdf.errors import PdfReadError
 
 MAX_CV_BYTES = 5 * 1024 * 1024
 CHUNK_BYTES = 64 * 1024
-CV_DIRECTORY = Path(__file__).resolve().parent / "uploads" / "cvs"
 
 
 class InvalidCVError(ValueError):
@@ -23,24 +21,21 @@ class CVTooLargeError(ValueError):
 @dataclass(frozen=True)
 class ValidatedCV:
     data: bytes
-    sha256: str
-
-
-def resolve_storage_path(storage_path: str) -> Path:
-    expected_prefix = "uploads/cvs/"
-    if not storage_path.startswith(expected_prefix):
-        raise ValueError("The stored CV path is invalid.")
-    filename = storage_path[len(expected_prefix) :]
-    if not filename or Path(filename).name != filename:
-        raise ValueError("The stored CV path is invalid.")
-    resolved = (CV_DIRECTORY / filename).resolve()
-    if resolved.parent != CV_DIRECTORY.resolve():
-        raise ValueError("The stored CV path is invalid.")
-    return resolved
 
 
 async def validate_cv_upload(upload: UploadFile) -> ValidatedCV:
-    digest = hashlib.sha256()
+    filename = upload.filename or ""
+    if Path(filename).suffix.lower() != ".pdf":
+        raise InvalidCVError("The uploaded CV must be a PDF file.")
+    content_type = (upload.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type not in {
+        "",
+        "application/pdf",
+        "application/x-pdf",
+        "application/octet-stream",
+    }:
+        raise InvalidCVError("The uploaded CV must have PDF content type.")
+
     size = 0
     header = bytearray()
     tail = bytearray()
@@ -58,7 +53,6 @@ async def validate_cv_upload(upload: UploadFile) -> ValidatedCV:
         tail.extend(chunk)
         if len(tail) > 1024:
             del tail[:-1024]
-        digest.update(chunk)
         content.extend(chunk)
 
     if b"%PDF-" not in header or b"%%EOF" not in tail:
@@ -73,4 +67,4 @@ async def validate_cv_upload(upload: UploadFile) -> ValidatedCV:
             "The uploaded file is not a valid PDF document."
         ) from exc
 
-    return ValidatedCV(data=pdf_data, sha256=digest.hexdigest())
+    return ValidatedCV(data=pdf_data)

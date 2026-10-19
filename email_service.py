@@ -1,20 +1,40 @@
 import os
-from io import BytesIO
 
+from email.message import EmailMessage
+from io import BytesIO
+from pathlib import Path
+
+from aiosmtplib import SMTP
+from aiosmtplib.errors import (
+    SMTPAuthenticationError,
+    SMTPConnectError,
+    SMTPDataError,
+    SMTPException,
+    SMTPRecipientRefused,
+    SMTPRecipientsRefused,
+    SMTPSenderRefused,
+    SMTPServerDisconnected,
+    SMTPTimeoutError,
+)
 from dotenv import load_dotenv
-from fastapi_mail import ConnectionConfig, FastMail, MessageSchema, MessageType
-from starlette.datastructures import Headers, UploadFile as AttachmentUploadFile
 
 from models import Application
-from storage import resolve_storage_path
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().with_name(".env"))
+
+
+class EmailConfigurationError(RuntimeError):
+    pass
+
+
+class EmailDeliveryError(RuntimeError):
+    pass
 
 
 def _required_mail_setting(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        raise RuntimeError(f"Missing email configuration in .env: {name}")
+        raise EmailConfigurationError(f"Missing email configuration: {name}.")
     return value
 
 
@@ -27,30 +47,48 @@ def _boolean_setting(name: str, default: bool) -> bool:
         return True
     if normalized in {"false", "0", "no"}:
         return False
-    raise RuntimeError(f"{name} must be true or false.")
+    raise EmailConfigurationError(f"{name} must be true or false.")
 
 
 async def send_application_email(application: Application) -> None:
     try:
         port = int(_required_mail_setting("MAIL_PORT"))
     except ValueError as exc:
-        raise RuntimeError("MAIL_PORT must be a valid TCP port number.") from exc
+        raise EmailConfigurationError(
+            "MAIL_PORT must be a valid TCP port number."
+        ) from exc
     if not 1 <= port <= 65535:
-        raise RuntimeError("MAIL_PORT must be between 1 and 65535.")
+        raise EmailConfigurationError("MAIL_PORT must be between 1 and 65535.")
 
-    config = ConnectionConfig(
-        MAIL_USERNAME=_required_mail_setting("MAIL_USERNAME"),
-        MAIL_PASSWORD=_required_mail_setting("MAIL_PASSWORD"),
-        MAIL_FROM=_required_mail_setting("MAIL_FROM"),
-        MAIL_PORT=port,
-        MAIL_SERVER=_required_mail_setting("MAIL_SERVER"),
-        MAIL_STARTTLS=_boolean_setting("MAIL_STARTTLS", True),
-        MAIL_SSL_TLS=_boolean_setting("MAIL_SSL_TLS", False),
-        USE_CREDENTIALS=True,
-        VALIDATE_CERTS=True,
-    )
+    mail_starttls = _boolean_setting("MAIL_STARTTLS", True)
+    mail_ssl_tls = _boolean_setting("MAIL_SSL_TLS", False)
+    if mail_starttls and mail_ssl_tls:
+        raise EmailConfigurationError(
+            "MAIL_STARTTLS and MAIL_SSL_TLS cannot both be true."
+        )
+
+    server = _required_mail_setting("MAIL_SERVER")
+    username = _required_mail_setting("MAIL_USERNAME")
+    password = "".join(_required_mail_setting("MAIL_PASSWORD").split())
+    sender = _required_mail_setting("MAIL_FROM")
     recipient = _required_mail_setting("MAIL_TO")
-    body = (
+    if server.lower() == "smtp.gmail.com" and (
+        port != 587 or not mail_starttls or mail_ssl_tls
+    ):
+        raise EmailConfigurationError(
+            "Gmail SMTP requires port 587 with MAIL_STARTTLS=true and "
+            "MAIL_SSL_TLS=false."
+        )
+    if server.lower() == "smtp.gmail.com" and sender.casefold() != username.casefold():
+        raise EmailConfigurationError(
+            "For Gmail SMTP, MAIL_FROM must match MAIL_USERNAME."
+        )
+
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = recipient
+    message["Subject"] = f"Interview application: {application.position}"
+    message.set_content(
         "A new interview application has been received.\n\n"
         f"Name: {application.full_name}\n"
         f"Email: {application.email}\n"
@@ -60,26 +98,67 @@ async def send_application_email(application: Application) -> None:
         f"{application.cover_letter or '(Not provided)'}\n\n"
         f"Application ID: {application.id}"
     )
-    if application.cv_data is not None:
-        attachments = [
-            AttachmentUploadFile(
-                filename=f"application-{application.id}-cv.pdf",
-                file=BytesIO(application.cv_data),
-                headers=Headers({"content-type": "application/pdf"}),
-            )
-        ]
-    elif application.cv_storage_path is not None:
-        attachments = [str(resolve_storage_path(application.cv_storage_path))]
-    else:
-        raise RuntimeError(
-            f"Application {application.id} does not have a stored CV."
+    try:
+        message.add_attachment(
+            application.cv_data,
+            maintype="application",
+            subtype="pdf",
+            filename=f"application-{application.id}-cv.pdf",
         )
+    except (TypeError, ValueError) as exc:
+        raise EmailDeliveryError(
+            "The CV attachment could not be added to the email."
+        ) from exc
 
-    message = MessageSchema(
-        subject=f"Interview application: {application.position}",
-        recipients=[recipient],
-        body=body,
-        subtype=MessageType.plain,
-        attachments=attachments,
-    )
-    await FastMail(config).send_message(message)
+    try:
+        async with SMTP(
+            hostname=server,
+            port=port,
+            start_tls=mail_starttls,
+            use_tls=mail_ssl_tls,
+            validate_certs=True,
+            timeout=20,
+        ) as smtp:
+            try:
+                await smtp.login(username, password)
+            except SMTPAuthenticationError as exc:
+                raise EmailDeliveryError(
+                    "Gmail rejected SMTP authentication. Verify MAIL_USERNAME and "
+                    "use a current Gmail App Password in MAIL_PASSWORD."
+                ) from exc
+            except SMTPServerDisconnected as exc:
+                raise EmailDeliveryError(
+                    "Gmail closed the connection during SMTP authentication. "
+                    "Verify MAIL_USERNAME, the Gmail App Password, and the "
+                    "account's SMTP access."
+                ) from exc
+            await smtp.send_message(message)
+    except SMTPAuthenticationError as exc:
+        raise EmailDeliveryError(
+            "Gmail rejected SMTP authentication. Verify MAIL_USERNAME and use a "
+            "current Gmail App Password in MAIL_PASSWORD."
+        ) from exc
+    except EmailDeliveryError:
+        raise
+    except SMTPTimeoutError as exc:
+        raise EmailDeliveryError(
+            "The SMTP server timed out before accepting the email."
+        ) from exc
+    except (SMTPConnectError, SMTPServerDisconnected, OSError) as exc:
+        raise EmailDeliveryError(
+            "The SMTP connection closed before the email was accepted. Check "
+            "network access and Gmail SMTP settings."
+        ) from exc
+    except (SMTPSenderRefused, SMTPRecipientRefused, SMTPRecipientsRefused) as exc:
+        raise EmailDeliveryError(
+            "The SMTP server rejected the sender or recipient address."
+        ) from exc
+    except SMTPDataError as exc:
+        raise EmailDeliveryError(
+            "The SMTP server rejected the email content or CV attachment."
+        ) from exc
+    except SMTPException as exc:
+        raise EmailDeliveryError(
+            "The SMTP server could not accept the email. Check its response in "
+            "the server logs."
+        ) from exc
