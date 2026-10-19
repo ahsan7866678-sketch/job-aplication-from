@@ -74,6 +74,25 @@ curl.exe -X POST "http://127.0.0.1:8000/applications" `
 Each valid request sends a new email. Requests are not stored and retries are
 not deduplicated; a retry after an uncertain email result may send a duplicate.
 
+## Submit a project enquiry
+
+The `POST /api/enquiry` endpoint accepts form fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Your name (maximum 200 characters) |
+| `email` | Yes | Your valid email address |
+| `phone` | Yes | Phone number (maximum 40 characters) |
+| `description` | Yes | Project description (maximum 5,000 characters) |
+
+The endpoint validates the fields and emails the enquiry to the existing
+`MAIL_TO` recipient using the same `MAIL_*` SMTP configuration as application
+submissions. The sender's reply address is set to the supplied customer email.
+Enquiries are not stored. A successful response is returned only after the
+SMTP server accepts the message; invalid data returns HTTP `422`, email
+configuration errors return HTTP `503`, and delivery errors return HTTP `502`.
+No additional environment configuration is required.
+
 ## Responses
 
 Successful submission (HTTP `201`):

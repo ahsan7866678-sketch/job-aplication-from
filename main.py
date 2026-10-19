@@ -19,12 +19,14 @@ from email_service import (
     EmailDeliveryError,
     send_application_email,
 )
+from enquiry import router as enquiry_router
 from models import Application
 from storage import CVTooLargeError, InvalidCVError, validate_cv_upload
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Interview Application API")
+app.include_router(enquiry_router)
 
 
 @app.get("/", include_in_schema=False)
